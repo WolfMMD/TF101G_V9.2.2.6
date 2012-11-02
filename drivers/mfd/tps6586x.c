@@ -27,6 +27,15 @@
 #include <linux/mfd/core.h>
 #include <linux/mfd/tps6586x.h>
 
+//=================stree test=================
+#include <linux/miscdevice.h>
+#include <linux/ioctl.h>
+#include <linux/fs.h>
+//=================stree test end =================
+#define TPS6586X_SUPPLYENE  0x14
+#define EXITSLREQ_BIT       BIT(1) /* Exit sleep mode request */
+#define SLEEP_MODE_BIT      BIT(3) /* Sleep mode */
+
 /* GPIO control registers */
 #define TPS6586X_GPIOSET1	0x5d
 #define TPS6586X_GPIOSET2	0x5e
@@ -100,6 +109,9 @@ struct tps6586x {
 	u32			irq_en;
 	u8			mask_cache[5];
 	u8			mask_reg[5];
+	int			i2c_status;
+	struct delayed_work stress_test;
+	struct miscdevice tps6586x_misc;
 };
 
 static inline int __tps6586x_read(struct i2c_client *client,
@@ -251,6 +263,41 @@ out:
 }
 EXPORT_SYMBOL_GPL(tps6586x_update);
 
+static struct i2c_client *tps6586x_i2c_client = NULL;
+int tps6586x_power_off(void)
+{
+	struct device *dev = NULL;
+	int ret = -EINVAL;
+      unsigned char val=0;
+	if (!tps6586x_i2c_client)
+		return ret;
+
+	dev = &tps6586x_i2c_client->dev;
+#if 1
+	/*ret = tps6586x_clr_bits(dev, TPS6586X_SUPPLYENE, EXITSLREQ_BIT);
+	if (ret)
+		return ret;*/
+
+	ret = tps6586x_set_bits(dev, TPS6586X_SUPPLYENE, SLEEP_MODE_BIT);
+	if (ret)
+		return ret;
+#else
+	ret = tps6586x_read(dev, TPS6586X_SUPPLYENE, &val);
+	if (ret){
+		printk("tps6586x_power_off read TPS6586X_SUPPLYENE failed!\n ");
+		return ret;
+	}
+       val &= ~EXITSLREQ_BIT;
+       val |= SLEEP_MODE_BIT;
+	ret = tps6586x_write(dev, TPS6586X_SUPPLYENE, val);
+	if (ret){
+		printk("tps6586x_power_off write TPS6586X_SUPPLYENE failed!\n ");
+		return ret;
+	}
+#endif
+	return 0;
+}
+
 static int tps6586x_gpio_get(struct gpio_chip *gc, unsigned offset)
 {
 	struct tps6586x *tps6586x = container_of(gc, struct tps6586x, gpio);
@@ -270,8 +317,14 @@ static void tps6586x_gpio_set(struct gpio_chip *chip, unsigned offset,
 {
 	struct tps6586x *tps6586x = container_of(chip, struct tps6586x, gpio);
 
-	__tps6586x_write(tps6586x->client, TPS6586X_GPIOSET2,
-			 value << offset);
+	tps6586x_update(tps6586x->dev, TPS6586X_GPIOSET2,
+			value << offset, 1 << offset);
+}
+
+static int tps6586x_gpio_input(struct gpio_chip *gc, unsigned offset)
+{
+	/* FIXME: add handling of GPIOs as dedicated inputs */
+	return -ENOSYS;
 }
 
 static int tps6586x_gpio_output(struct gpio_chip *gc, unsigned offset,
@@ -279,8 +332,13 @@ static int tps6586x_gpio_output(struct gpio_chip *gc, unsigned offset,
 {
 	struct tps6586x *tps6586x = container_of(gc, struct tps6586x, gpio);
 	uint8_t val, mask;
+	int ret;
 
-	tps6586x_gpio_set(gc, offset, value);
+	val = value << offset;
+	mask = 0x1 << offset;
+	ret = tps6586x_update(tps6586x->dev, TPS6586X_GPIOSET2, val, mask);
+	if (ret)
+		return ret;
 
 	val = 0x1 << (offset * 2);
 	mask = 0x3 << (offset * 2);
@@ -300,7 +358,7 @@ static int tps6586x_gpio_init(struct tps6586x *tps6586x, int gpio_base)
 	tps6586x->gpio.ngpio		= 4;
 	tps6586x->gpio.can_sleep	= 1;
 
-	/* FIXME: add handling of GPIOs as dedicated inputs */
+	tps6586x->gpio.direction_input	= tps6586x_gpio_input;
 	tps6586x->gpio.direction_output	= tps6586x_gpio_output;
 	tps6586x->gpio.set		= tps6586x_gpio_set;
 	tps6586x->gpio.get		= tps6586x_gpio_get;
@@ -473,13 +531,95 @@ failed:
 	tps6586x_remove_subdevs(tps6586x);
 	return ret;
 }
+struct tps6586x *temp_tps6586x=NULL;
 
+static ssize_t show_tps6586x_i2c_status(struct device *dev, struct device_attribute *devattr, char *buf)
+{
+	return sprintf(buf, "%d\n", temp_tps6586x->i2c_status);
+}
+static DEVICE_ATTR(tps6586x_i2c_status, S_IWUSR | S_IRUGO,show_tps6586x_i2c_status,NULL);
+
+static struct attribute *tps6586x_i2c_attributes[] = {
+
+	&dev_attr_tps6586x_i2c_status.attr,
+	NULL,
+};
+
+static const struct attribute_group tps6586x_i2c_group = {
+	.attrs = tps6586x_i2c_attributes,
+};
+
+
+#define TPS6586X_IOC_MAGIC	0xFB
+#define TPS6586X_IOC_MAXNR	5
+#define TPS6586X_POLLING_DATA _IOR(TPS6586X_IOC_MAGIC, 1,int)
+
+#define TEST_END (0)
+#define START_NORMAL (1)
+#define START_HEAVY (2)
+#define IOCTL_ERROR (-1)
+ struct workqueue_struct *tps6586x_strees_work_queue=NULL;
+
+void tps6586x_read_stress_test(struct work_struct *work)
+{
+	uint8_t reg_val;
+	int ret = 0;
+
+	mutex_lock(&temp_tps6586x->lock);
+
+	ret = __tps6586x_read(temp_tps6586x->client, 0xCD, &reg_val);
+	if (ret < 0) {
+		printk("failed ps6586x_read_stress_test \n");
+	}
+
+	mutex_unlock(&temp_tps6586x->lock);
+	return ;
+}
+long  tps6586x_ioctl(struct file *filp,  unsigned int cmd, unsigned long arg)
+{
+	if (_IOC_TYPE(cmd) ==TPS6586X_IOC_MAGIC){
+	     printk("  tps6586x_ioctl vaild magic \n");
+		}
+	else	{
+		printk("  tps6586x_ioctl invaild magic \n");
+		return -ENOTTY;
+		}
+
+	switch(cmd)
+	{
+		 case TPS6586X_POLLING_DATA :
+		    if ((arg==START_NORMAL)||(arg==START_HEAVY)){
+				 printk(" tps6586x stress test start (%s)\n",(arg==START_NORMAL)?"normal":"heavy");
+				 queue_delayed_work(tps6586x_strees_work_queue, &temp_tps6586x->stress_test, 2*HZ);
+		    }
+		else{
+				 printk(" t tps6586x tress test end\n");
+				 cancel_delayed_work_sync(&temp_tps6586x->stress_test);
+	      }
+		break;
+	  default:  /* redundant, as cmd was checked against MAXNR */
+	           printk("  TPS6586X: unknow i2c  stress test  command cmd=%x arg=%lu\n",cmd,arg);
+		return -ENOTTY;
+		}
+   return 0;
+}
+int tps6586x_open(struct inode *inode, struct file *filp)
+{
+	return 0;
+}
+struct file_operations tps6586x_fops = {
+	.owner =    THIS_MODULE,
+	.unlocked_ioctl =   tps6586x_ioctl,
+	.open =  tps6586x_open,
+};
+//========================================
 static int __devinit tps6586x_i2c_probe(struct i2c_client *client,
 					const struct i2c_device_id *id)
 {
 	struct tps6586x_platform_data *pdata = client->dev.platform_data;
 	struct tps6586x *tps6586x;
 	int ret;
+	int rc=0;
 
 	if (!pdata) {
 		dev_err(&client->dev, "tps6586x requires platform data\n");
@@ -525,6 +665,20 @@ static int __devinit tps6586x_i2c_probe(struct i2c_client *client,
 		goto err_add_devs;
 	}
 
+	tps6586x_i2c_client = client;
+	temp_tps6586x=tps6586x;
+       temp_tps6586x->i2c_status=1;
+	if (sysfs_create_group(&client->dev.kobj, &tps6586x_i2c_group)) {
+		dev_err(&client->dev, "tps6586x_i2c_probe:Not able to create the sysfs\n");
+	}
+       INIT_DELAYED_WORK(&temp_tps6586x->stress_test,  tps6586x_read_stress_test) ;
+       tps6586x_strees_work_queue = create_singlethread_workqueue("tps6586x_strees_test_workqueue");
+
+	temp_tps6586x->tps6586x_misc.minor	= MISC_DYNAMIC_MINOR;
+	temp_tps6586x->tps6586x_misc.name	= "tps6586x";
+	temp_tps6586x->tps6586x_misc.fops  	= &tps6586x_fops;
+       rc=misc_register(&temp_tps6586x->tps6586x_misc);
+	 printk(KERN_INFO "tps6586x register misc device for I2C stress test rc=%x\n", rc);
 	return 0;
 
 err_add_devs:
@@ -568,15 +722,35 @@ static const struct i2c_device_id tps6586x_id_table[] = {
 	{ },
 };
 MODULE_DEVICE_TABLE(i2c, tps6586x_id_table);
+#ifdef CONFIG_PM
+#include <mach/irqs.h>
+static int tps6586x_suspend(struct i2c_client *client, pm_message_t state)
+{
+	printk("tps6586x_suspend\n");
+	disable_irq(INT_EXTERNAL_PMU);
+	return 0;
+}
 
+static int tps6586x_resume(struct i2c_client *client)
+{
+	printk("tps6586x_resume\n");
+	enable_irq(INT_EXTERNAL_PMU);
+	return 0;
+}
+#else
+#define tps6586x_suspend NULL
+#define tps6586x_resume NULL
+#endif
 static struct i2c_driver tps6586x_driver = {
 	.driver	= {
 		.name	= "tps6586x",
 		.owner	= THIS_MODULE,
 	},
-	.probe		= tps6586x_i2c_probe,
-	.remove		= __devexit_p(tps6586x_i2c_remove),
-	.id_table	= tps6586x_id_table,
+	.probe	=	tps6586x_i2c_probe,
+	.remove	=	__devexit_p(tps6586x_i2c_remove),
+	.suspend	=	tps6586x_suspend,
+	.resume	=	tps6586x_resume,
+	.id_table	=	tps6586x_id_table,
 };
 
 static int __init tps6586x_init(void)

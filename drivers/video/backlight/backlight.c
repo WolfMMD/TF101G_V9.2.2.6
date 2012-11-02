@@ -37,9 +37,13 @@ static int fb_notifier_callback(struct notifier_block *self,
 	struct backlight_device *bd;
 	struct fb_event *evdata = data;
 
+	printk("%s(%d)+\n", __FUNCTION__, __LINE__);
+
 	/* If we aren't interested in this event, skip it immediately ... */
-	if (event != FB_EVENT_BLANK && event != FB_EVENT_CONBLANK)
+	if (event != FB_EVENT_BLANK && event != FB_EVENT_CONBLANK) {
+		printk("%s(%d)-\n", __FUNCTION__, __LINE__);
 		return 0;
+	}
 
 	bd = container_of(self, struct backlight_device, fb_notif);
 	mutex_lock(&bd->ops_lock);
@@ -54,6 +58,7 @@ static int fb_notifier_callback(struct notifier_block *self,
 			backlight_update_status(bd);
 		}
 	mutex_unlock(&bd->ops_lock);
+	printk("%s(%d)-\n", __FUNCTION__, __LINE__);
 	return 0;
 }
 

@@ -1034,11 +1034,13 @@ fb_blank(struct fb_info *info, int blank)
 {	
  	int ret = -EINVAL;
 
+	printk("%s(%d)+: blank= %d\n", __FUNCTION__, __LINE__, blank);
+
  	if (blank > FB_BLANK_POWERDOWN)
  		blank = FB_BLANK_POWERDOWN;
 
 	if (info->fbops->fb_blank)
- 		ret = info->fbops->fb_blank(blank, info);
+		ret = info->fbops->fb_blank(blank, info); /* to fb.c */
 
  	if (!ret) {
 		struct fb_event event;
@@ -1047,7 +1049,7 @@ fb_blank(struct fb_info *info, int blank)
 		event.data = &blank;
 		fb_notifier_call_chain(FB_EVENT_BLANK, &event);
 	}
-
+	printk("%s(%d)-: ret= %d\n", __FUNCTION__, __LINE__, ret);
  	return ret;
 }
 

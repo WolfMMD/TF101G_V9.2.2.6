@@ -36,6 +36,33 @@
 #include <trace/events/asoc.h>
 
 #include "wm8903.h"
+#include "codec_param.h"
+
+#define AUDIO_IOC_MAGIC	0xf7
+#define AUDIO_IOC_MAXNR	4
+#define AUDIO_STRESS_TEST	_IOW(AUDIO_IOC_MAGIC, 1,int)
+#define AUDIO_I2C_READ	_IOW(AUDIO_IOC_MAGIC, 2,int)
+#define AUDIO_I2C_WRITE	_IOW(AUDIO_IOC_MAGIC, 3,int)
+#define AUDIO_CAPTURE_MODE _IOW(AUDIO_IOC_MAGIC, 4,int)
+#define AUDIO_IOCTL_START_HEAVY (2)
+#define AUDIO_IOCTL_START_NORMAL (1)
+#define AUDIO_IOCTL_STOP (0)
+#define START_NORMAL (HZ/2)
+#define START_HEAVY (HZ/20)
+
+/* We use input and out souce to identify recording for normal use, voice call, and voice search */
+#define INPUT_SOURCE_NORMAL 100
+#define INPUT_SOURCE_VR 101
+#define OUTPUT_SOURCE_NORMAL	 200
+#define OUTPUT_SOURCE_VOICE 201
+
+/*Use delayed work for i2c stress test */
+static int poll_rate = 0;
+static struct delayed_work poll_audio_work;
+static int count_base = 1;
+static int count_100 = 0;
+static int input_source=INPUT_SOURCE_NORMAL;
+static int output_source=OUTPUT_SOURCE_NORMAL;
 
 /* Register defaults at reset */
 static u16 wm8903_reg_defaults[] = {
@@ -80,7 +107,7 @@ static u16 wm8903_reg_defaults[] = {
 	0x0000,     /* R38  - ADC Digital 0 */
 	0x0073,     /* R39  - Digital Microphone 0 */
 	0x09BF,     /* R40  - DRC 0 */
-	0x3241,     /* R41  - DRC 1 */
+	0x3243,     /* R41  - DRC 1 */
 	0x0020,     /* R42  - DRC 2 */
 	0x0000,     /* R43  - DRC 3 */
 	0x0085,     /* R44  - Analogue Left Input 0 */
@@ -240,6 +267,42 @@ struct wm8903_priv {
 #endif
 };
 
+bool need_spk = true;       //keep legacy flag
+EXPORT_SYMBOL(need_spk);
+
+static int codec_wm8903_status = 0;
+static ssize_t read_sysfs_codec_status(struct device *dev, struct device_attribute *devattr, char *buf)
+{
+       return sprintf(buf, "%d\n", codec_wm8903_status);
+}
+DEVICE_ATTR(audio_codec_status, S_IRUGO, read_sysfs_codec_status, NULL);
+
+static struct attribute *audio_codec_attr[] = {
+       &dev_attr_audio_codec_status.attr,
+       NULL
+};
+
+struct snd_soc_codec *global_codec;
+EXPORT_SYMBOL(global_codec) ;
+
+struct wm8903_parameters audio_params[]={
+	/* TF101(EP101) */
+	{
+		0x3D,	/* Speaker volume: +4dB*/
+		0x37,	/* Headset volume: -2dB*/
+		0xC0,	/* DMIC ADC volume: 0dB*/
+		0x05,	/* AMIC volume: +24dB, for differential MIC*/
+	},
+	/* SL101(EP102) */
+	{
+		0x39,	/* Speaker volume: +0dB*/
+		0x37,	/* Headset volume: -2dB*/
+		0xC0,	/* DMIC ADC volume: 0dB*/
+		0x05,	/* AMIC volume: +24dB, for differential MIC*/
+	}
+};
+EXPORT_SYMBOL(audio_params);
+
 static int wm8903_volatile_register(struct snd_soc_codec *codec, unsigned int reg)
 {
 	switch (reg) {
@@ -263,6 +326,32 @@ static void wm8903_reset(struct snd_soc_codec *codec)
 	snd_soc_write(codec, WM8903_SW_RESET_AND_ID, 0);
 	memcpy(codec->reg_cache, wm8903_reg_defaults,
 	       sizeof(wm8903_reg_defaults));
+}
+
+/*
+ * Event for speaker power changes to enable amp.
+ */
+static int wm8903_spk_event(struct snd_soc_dapm_widget *w,
+			       struct snd_kcontrol *kcontrol, int event)
+{
+	struct snd_soc_codec *codec = w->codec;
+	u16 val;
+	u16 reg;
+	u16 dcs_reg;
+	u16 dcs_bit;
+	int shift;
+
+	if (event & SND_SOC_DAPM_POST_PMU) {
+		snd_soc_write(codec, WM8903_GPIO_CONTROL_3, 0x0033);
+		need_spk=true;
+	}
+
+	if (event & SND_SOC_DAPM_PRE_PMD) {
+		snd_soc_write(codec, WM8903_GPIO_CONTROL_3, 0x0000);
+		need_spk=false;
+	}
+
+	return 0;
 }
 
 static int wm8903_cp_event(struct snd_soc_dapm_widget *w,
@@ -634,6 +723,13 @@ static const struct soc_enum lsidetone_enum =
 static const struct soc_enum rsidetone_enum =
 	SOC_ENUM_SINGLE(WM8903_DAC_DIGITAL_0, 0, 3, sidetone_text);
 
+static const char *adcinput_text[] = {
+	"ADC", "DMIC"
+};
+
+static const struct soc_enum adcinput_enum =
+	SOC_ENUM_SINGLE(WM8903_CLOCK_RATE_TEST_4, 9, 2, adcinput_text);
+
 static const char *aif_text[] = {
 	"Left", "Right"
 };
@@ -767,6 +863,9 @@ static const struct snd_kcontrol_new lsidetone_mux =
 static const struct snd_kcontrol_new rsidetone_mux =
 	SOC_DAPM_ENUM("DACR Sidetone Mux", rsidetone_enum);
 
+static const struct snd_kcontrol_new adcinput_mux =
+	SOC_DAPM_ENUM("ADC Input", adcinput_enum);
+
 static const struct snd_kcontrol_new lcapture_mux =
 	SOC_DAPM_ENUM("Left Capture Mux", lcapture_enum);
 
@@ -811,12 +910,14 @@ SOC_DAPM_SINGLE("Right Bypass Switch", WM8903_ANALOGUE_SPK_MIX_RIGHT_0,
 };
 
 static const struct snd_soc_dapm_widget wm8903_dapm_widgets[] = {
+SND_SOC_DAPM_INPUT("DMIC"),
 SND_SOC_DAPM_INPUT("IN1L"),
 SND_SOC_DAPM_INPUT("IN1R"),
 SND_SOC_DAPM_INPUT("IN2L"),
 SND_SOC_DAPM_INPUT("IN2R"),
 SND_SOC_DAPM_INPUT("IN3L"),
 SND_SOC_DAPM_INPUT("IN3R"),
+SND_SOC_DAPM_INPUT("DMICDAT"),
 
 SND_SOC_DAPM_OUTPUT("HPOUTL"),
 SND_SOC_DAPM_OUTPUT("HPOUTR"),
@@ -841,6 +942,9 @@ SND_SOC_DAPM_MUX("Right Input Mode Mux", SND_SOC_NOPM, 0, 0, &rinput_mode_mux),
 
 SND_SOC_DAPM_PGA("Left Input PGA", WM8903_POWER_MANAGEMENT_0, 1, 0, NULL, 0),
 SND_SOC_DAPM_PGA("Right Input PGA", WM8903_POWER_MANAGEMENT_0, 0, 0, NULL, 0),
+
+SND_SOC_DAPM_MUX("Left ADC Input", SND_SOC_NOPM, 0, 0, &adcinput_mux),
+SND_SOC_DAPM_MUX("Right ADC Input", SND_SOC_NOPM, 0, 0, &adcinput_mux),
 
 SND_SOC_DAPM_ADC("ADCL", NULL, WM8903_POWER_MANAGEMENT_6, 1, 0),
 SND_SOC_DAPM_ADC("ADCR", NULL, WM8903_POWER_MANAGEMENT_6, 0, 0),
@@ -919,10 +1023,12 @@ SND_SOC_DAPM_PGA_S("LINEOUTL_DCS", 3, SND_SOC_NOPM, 1, 0, wm8903_dcs_event,
 SND_SOC_DAPM_PGA_S("LINEOUTR_DCS", 3, SND_SOC_NOPM, 0, 0, wm8903_dcs_event,
 		   SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD),
 
-SND_SOC_DAPM_PGA("Left Speaker PGA", WM8903_POWER_MANAGEMENT_5, 1, 0,
-		 NULL, 0),
-SND_SOC_DAPM_PGA("Right Speaker PGA", WM8903_POWER_MANAGEMENT_5, 0, 0,
-		 NULL, 0),
+SND_SOC_DAPM_PGA_E("Left Speaker PGA", WM8903_POWER_MANAGEMENT_5, 1, 0,
+		 NULL, 0, wm8903_spk_event,
+		SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD),
+SND_SOC_DAPM_PGA_E("Right Speaker PGA", WM8903_POWER_MANAGEMENT_5, 0, 0,
+		 NULL, 0, wm8903_spk_event,
+		SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD),
 
 SND_SOC_DAPM_SUPPLY("Charge Pump", WM8903_CHARGE_PUMP_0, 0, 0,
 		    wm8903_cp_event, SND_SOC_DAPM_POST_PMU),
@@ -979,6 +1085,11 @@ static const struct snd_soc_dapm_route intercon[] = {
 	{ "Left Input PGA", NULL, "Left Input Mode Mux" },
 	{ "Right Input PGA", NULL, "Right Input Mode Mux" },
 
+	{ "Left ADC Input", "ADC", "Left Input PGA" },
+	{ "Left ADC Input", "DMIC", "DMICDAT" },
+	{ "Right ADC Input", "ADC", "Right Input PGA" },
+	{ "Right ADC Input", "DMIC", "DMICDAT" },
+
 	{ "Left Capture Mux", "Left", "ADCL" },
 	{ "Left Capture Mux", "Right", "ADCR" },
 
@@ -988,9 +1099,12 @@ static const struct snd_soc_dapm_route intercon[] = {
 	{ "AIFTXL", NULL, "Left Capture Mux" },
 	{ "AIFTXR", NULL, "Right Capture Mux" },
 
-	{ "ADCL", NULL, "Left Input PGA" },
+	{ "ADCL", NULL, "DMIC" },
+	{ "ADCR", NULL, "DMIC" },
+
+	{ "ADCL", NULL, "Left ADC Input" },
 	{ "ADCL", NULL, "CLK_DSP" },
-	{ "ADCR", NULL, "Right Input PGA" },
+	{ "ADCR", NULL, "Right ADC Input" },
 	{ "ADCR", NULL, "CLK_DSP" },
 
 	{ "Left Playback Mux", "Left", "AIFRXL" },
@@ -1752,20 +1866,31 @@ static struct snd_soc_dai_driver wm8903_dai = {
 
 static int wm8903_suspend(struct snd_soc_codec *codec, pm_message_t state)
 {
+	struct wm8903_priv *wm8903 = snd_soc_codec_get_drvdata(codec);
+
+	printk(KERN_INFO "%s+ #####\n", __func__);
+
+	if (wm8903->irq)
+		disable_irq(wm8903->irq);
+
 	wm8903_set_bias_level(codec, SND_SOC_BIAS_OFF);
 
+	printk(KERN_INFO "%s- #####\n", __func__);
 	return 0;
 }
 
 static int wm8903_resume(struct snd_soc_codec *codec)
 {
+	struct wm8903_priv *wm8903 = snd_soc_codec_get_drvdata(codec);
 	int i;
 	u16 *reg_cache = codec->reg_cache;
 	u16 *tmp_cache = kmemdup(reg_cache, sizeof(wm8903_reg_defaults),
 				 GFP_KERNEL);
 
-	/* Bring the codec back up to standby first to minimise pop/clicks */
-	wm8903_set_bias_level(codec, SND_SOC_BIAS_STANDBY);
+	printk(KERN_INFO "%s+ #####\n", __func__);
+
+	if (wm8903->irq)
+		enable_irq(wm8903->irq);
 
 	/* Sync back everything else */
 	if (tmp_cache) {
@@ -1776,6 +1901,9 @@ static int wm8903_resume(struct snd_soc_codec *codec)
 	} else {
 		dev_err(codec->dev, "Failed to allocate temporary cache\n");
 	}
+	/* Bring the codec back up to standby first to minimise pop/clicks */
+	wm8903_set_bias_level(codec, SND_SOC_BIAS_STANDBY);
+	printk("%s-\n", __func__);
 
 	return 0;
 }
@@ -1894,6 +2022,131 @@ static void wm8903_free_gpio(struct snd_soc_codec *codec)
 }
 #endif
 
+static int audio_codec_open(struct inode *inode, struct file *filp)
+{
+	return 0;
+}
+
+static int audio_codec_stress(void)
+{
+	u16 temp = 0;
+
+	temp = snd_soc_read(global_codec, WM8903_SW_RESET_AND_ID); /* Read codec device ID */
+
+	count_base = count_base+1;
+
+	if (count_base == 100){
+		count_base = 0;
+		count_100 = count_100 + 1;
+		printk("AUDIO_CODEC: count = %d (* 100), the register 0x%xh is %x\n",count_100, WM8903_SW_RESET_AND_ID, temp);
+	}
+
+	schedule_delayed_work(&poll_audio_work, poll_rate);
+
+	return 0;
+}
+
+static long audio_codec_ioctl(struct file *filp,
+                 unsigned int cmd, unsigned long arg)
+{
+	char tmp[3];
+	u8 address;
+	u16 buf[1];
+	int err = 0;
+	int retval = 0;
+
+	if (_IOC_TYPE(cmd) != AUDIO_IOC_MAGIC) return -ENOTTY;
+	if (_IOC_NR(cmd) > AUDIO_IOC_MAXNR) return -ENOTTY;
+
+	/*
+	 * the direction is a bitmask, and VERIFY_WRITE catches R/W
+	 * transfers. `Type' is user-oriented, while
+	 * access_ok is kernel-oriented, so the concept of "read" and
+	 * "write" is reversed
+	 * access_ok: 1 (successful, accessable)
+	 */
+	if (_IOC_DIR(cmd) & _IOC_READ)
+		err = !access_ok(VERIFY_WRITE, (void __user *)arg, _IOC_SIZE(cmd));
+	else if (_IOC_DIR(cmd) & _IOC_WRITE)
+		err =  !access_ok(VERIFY_READ, (void __user *)arg, _IOC_SIZE(cmd));
+	if (err) return -EFAULT;
+
+
+       /* cmd: the ioctl commend user-space asked */
+	switch(cmd){
+		case AUDIO_STRESS_TEST:
+			printk("AUDIO_CODEC: AUDIO_STRESS_TEST: %lu (1: Start, 0: Stop)\n",arg);
+			if(arg==AUDIO_IOCTL_START_HEAVY){
+				poll_rate = START_HEAVY;
+				schedule_delayed_work(&poll_audio_work, poll_rate);
+			}else if(arg==AUDIO_IOCTL_START_NORMAL){
+				poll_rate = START_NORMAL;
+				schedule_delayed_work(&poll_audio_work,poll_rate);
+			}else if(arg==AUDIO_IOCTL_STOP){
+				cancel_delayed_work_sync(&poll_audio_work);
+			}
+			break;
+
+		case AUDIO_I2C_READ:
+			if(copy_from_user(tmp, (void __user*)arg, sizeof(tmp))){
+				printk("AUDIO_CODEC : read data from user space fail\n");
+			}
+			address = (u8)tmp[0];
+			buf[0] = snd_soc_read(global_codec, address);
+			tmp[1] = buf[0];
+			tmp[2] = buf[0]>>8;
+			printk("AUDIO_CODEC: Read 0X%02x = 0X%04x\n", tmp[0], (tmp[2] <<8 |tmp[1]));
+			if(copy_to_user((void __user*)arg, tmp, sizeof(tmp))){
+				printk("AUDIO_CODEC: AUDIO_I2C_READ error\n");
+			}
+			break;
+
+		case AUDIO_I2C_WRITE:
+			if(copy_from_user(tmp,(void __user *)arg,sizeof(tmp)))
+				return -EFAULT;
+			printk("AUDIO_CODEC: Write 0X%02x = 0X%04x\n",tmp[0],(tmp[2] <<8 |tmp[1]));
+
+			snd_soc_write( global_codec, tmp[0], (tmp[2] <<8 |tmp[1]));
+			if(copy_to_user((void __user*)arg, tmp, sizeof(tmp)))
+				return -EFAULT;
+			break;
+		case AUDIO_CAPTURE_MODE:
+			switch(arg){
+				case INPUT_SOURCE_NORMAL:
+				case INPUT_SOURCE_VR:
+					printk("AUDIO_CODEC: Capture mode [%s]\n",
+						 arg == INPUT_SOURCE_NORMAL ? "NORMAL" : "VR");
+					input_source=arg;
+					break;
+				case OUTPUT_SOURCE_NORMAL:
+				case OUTPUT_SOURCE_VOICE:
+					printk("AUDIO_CODEC: Capture mode [%s]\n",
+						 arg == OUTPUT_SOURCE_NORMAL ? "NORMAL" : "VOICE");
+					output_source=arg;
+					break;
+				default:
+					break;
+			}
+			break;
+
+		default:  /* redundant, as cmd was checked against MAXNR */
+			return -ENOTTY;
+	}
+	return retval;
+}
+
+static struct file_operations audio_codec_fops = {
+	.owner =    THIS_MODULE,
+	.open =     audio_codec_open,
+	.unlocked_ioctl =    audio_codec_ioctl,
+};
+
+static struct miscdevice i2c_audio_device = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "wm8903",
+	.fops = &audio_codec_fops,
+};
+
 static int wm8903_probe(struct snd_soc_codec *codec)
 {
 	struct wm8903_platform_data *pdata = dev_get_platdata(codec->dev);
@@ -1902,11 +2155,15 @@ static int wm8903_probe(struct snd_soc_codec *codec)
 	int trigger, irq_pol;
 	u16 val;
 
+	printk(KERN_INFO "%s+ #####\n", __func__);
+
 	wm8903->codec = codec;
+	global_codec = wm8903->codec;
 
 	ret = snd_soc_codec_set_cache_io(codec, 8, 16, SND_SOC_I2C);
 	if (ret != 0) {
 		dev_err(codec->dev, "Failed to set cache I/O: %d\n", ret);
+		printk(KERN_INFO "%s- Failed to set cache I/O! #####\n", __func__);
 		return ret;
 	}
 
@@ -1914,8 +2171,22 @@ static int wm8903_probe(struct snd_soc_codec *codec)
 	if (val != wm8903_reg_defaults[WM8903_SW_RESET_AND_ID]) {
 		dev_err(codec->dev,
 			"Device with ID register %x is not a WM8903\n", val);
+		printk(KERN_INFO "%s- Device with ID register is not a WM8903! #####\n", __func__);
 		return -ENODEV;
 	}
+
+	ret = device_create_file(codec->dev, &dev_attr_audio_codec_status);
+	if (ret != 0) {
+		dev_err(codec->dev,
+			"Failed to create audio_codec_status sysfs files: %d\n", ret);
+		printk(KERN_INFO "%s- Failed to create audio_codec_status sysfs files! #####\n", __func__);
+		return ret;
+	}
+	if(val == wm8903_reg_defaults[WM8903_SW_RESET_AND_ID])
+		codec_wm8903_status = 1;
+	else
+		printk("%s: incorrect audio codec wm8903 vendor ID\n", __func__);
+
 
 	val = snd_soc_read(codec, WM8903_REVISION_NUMBER);
 	dev_info(codec->dev, "WM8903 revision %c\n",
@@ -1965,7 +2236,7 @@ static int wm8903_probe(struct snd_soc_codec *codec)
 
 		wm8903->mic_delay = pdata->micdet_delay;
 	}
-	
+
 	if (wm8903->irq) {
 		if (pdata && pdata->irq_active_low) {
 			trigger = IRQF_TRIGGER_LOW;
@@ -1977,13 +2248,14 @@ static int wm8903_probe(struct snd_soc_codec *codec)
 
 		snd_soc_update_bits(codec, WM8903_INTERRUPT_CONTROL,
 				    WM8903_IRQ_POL, irq_pol);
-		
+
 		ret = request_threaded_irq(wm8903->irq, NULL, wm8903_irq,
 					   trigger | IRQF_ONESHOT,
 					   "wm8903", codec);
 		if (ret != 0) {
 			dev_err(codec->dev, "Failed to request IRQ: %d\n",
 				ret);
+			printk(KERN_INFO "%s- Failed to request IRQ! #####\n", __func__);
 			return ret;
 		}
 
@@ -2032,6 +2304,14 @@ static int wm8903_probe(struct snd_soc_codec *codec)
 
 	wm8903_init_gpio(codec);
 
+
+	INIT_DELAYED_WORK(&poll_audio_work, audio_codec_stress);
+	ret = misc_register(&i2c_audio_device);
+	if (ret < 0) {
+		printk("ERROR: misc_register returned %d\n", ret);
+	}
+
+	printk(KERN_INFO "%s- #####\n", __func__);
 	return ret;
 }
 
@@ -2063,9 +2343,13 @@ static __devinit int wm8903_i2c_probe(struct i2c_client *i2c,
 	struct wm8903_priv *wm8903;
 	int ret;
 
+	printk(KERN_INFO "%s+ #####\n", __func__);
+
 	wm8903 = kzalloc(sizeof(struct wm8903_priv), GFP_KERNEL);
-	if (wm8903 == NULL)
+	if (wm8903 == NULL){
+		printk(KERN_INFO "%s- wm8903 is NULL! #####\n", __func__);
 		return -ENOMEM;
+	}
 
 	i2c_set_clientdata(i2c, wm8903);
 	wm8903->irq = i2c->irq;
@@ -2074,7 +2358,22 @@ static __devinit int wm8903_i2c_probe(struct i2c_client *i2c,
 			&soc_codec_dev_wm8903, &wm8903_dai, 1);
 	if (ret < 0)
 		kfree(wm8903);
+
+	printk(KERN_INFO "%s- #####\n", __func__);
 	return ret;
+}
+
+static int wm8903_i2c_shutdown(struct i2c_client *client)
+{
+	struct wm8903_priv  *wm8903 = i2c_get_clientdata(client);
+
+	printk("%s+\n", __func__);
+	/* Diable speaker amp */
+	snd_soc_write(wm8903->codec, WM8903_GPIO_CONTROL_3, 0x0000);
+
+	wm8903_set_bias_level(wm8903->codec, SND_SOC_BIAS_OFF);
+	printk("%s-\n", __func__);
+	return 0;
 }
 
 static __devexit int wm8903_i2c_remove(struct i2c_client *client)
@@ -2097,6 +2396,7 @@ static struct i2c_driver wm8903_i2c_driver = {
 	},
 	.probe =    wm8903_i2c_probe,
 	.remove =   __devexit_p(wm8903_i2c_remove),
+	.shutdown = wm8903_i2c_shutdown,
 	.id_table = wm8903_i2c_id,
 };
 #endif
@@ -2104,6 +2404,9 @@ static struct i2c_driver wm8903_i2c_driver = {
 static int __init wm8903_modinit(void)
 {
 	int ret = 0;
+
+	printk(KERN_INFO "%s+ #####\n", __func__);
+
 #if defined(CONFIG_I2C) || defined(CONFIG_I2C_MODULE)
 	ret = i2c_add_driver(&wm8903_i2c_driver);
 	if (ret != 0) {
@@ -2111,6 +2414,8 @@ static int __init wm8903_modinit(void)
 		       ret);
 	}
 #endif
+
+	printk(KERN_INFO "%s- #####\n", __func__);
 	return ret;
 }
 module_init(wm8903_modinit);

@@ -21,6 +21,12 @@
 #include <linux/pwm_backlight.h>
 #include <linux/slab.h>
 
+#include <linux/delay.h>
+#include <mach/dc.h>
+#include <linux/gpio.h>
+/* LCD_BL_EN, GPIO_PD4 */
+#define ventana_bl_enb		28
+
 struct pwm_bl_data {
 	struct pwm_device	*pwm;
 	struct device		*dev;
@@ -31,29 +37,70 @@ struct pwm_bl_data {
 	int			(*check_fb)(struct device *, struct fb_info *);
 };
 
+/* For power saving, the mapping between brightness & duty is modified as Non-Linear. */
+static unsigned int asus_remapped_brightness[] = {
+	0, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550,
+	2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2550, 2805,
+	2805, 2805, 2805, 2805, 3060, 3060, 3060, 3060, 3060, 3315, 3315, 3315, 3315, 3315, 3570, 3570,
+	3570, 3570, 3570, 3825, 3825, 3825, 3825, 3825, 4080, 4080, 4080, 4080, 4080, 4335, 4335, 4335,
+	4335, 4335, 4590, 4590, 4590, 4590, 4590, 4845, 4845, 4845, 4845, 4845, 5100, 5100, 5100, 5100,
+	5100, 5355, 5355, 5355, 5355, 5610, 5610, 5610, 5610, 5865, 5865, 5865, 5865, 6120, 6120, 6120,
+	6120, 6375, 6375, 6375, 6375, 6630, 6630, 6630, 6630, 6885, 6885, 6885, 6885, 7140, 7140, 7140,
+	7140, 7395, 7395, 7395, 7395, 7650, 7650, 7650, 7650, 7905, 7905, 7905, 7905, 8160, 8160, 8160,
+	8160, 8415, 8415, 8415, 8415, 8670, 8670, 8670, 8670, 8925, 8925, 8925, 8925, 9180, 9180, 9180,
+	9180, 9435, 9435, 9435, 9435, 9690, 9690, 9690, 9690, 9945, 9945, 9945, 9945, 10200, 10200, 10200,
+	10200, 10455, 10455, 10455, 10710, 10710, 10710, 10965, 10965, 10965, 11220, 11220, 11220, 11475, 11475, 11475,
+	11730, 11730, 11730, 11985, 11985, 11985, 12240, 12240, 12240, 12495, 12495, 12495, 12750, 12750, 12750, 13005,
+	13005, 13005, 13260, 13260, 13260, 13515, 13515, 13770, 13770, 14025, 14025, 14280, 14280, 14535, 14535, 14790,
+	14790, 15045, 15045, 15300, 15300, 15555, 15555, 15810, 15810, 16065, 16065, 16320, 16575, 16830, 17085, 17340,
+	17595, 17850, 18105, 18360, 18615, 18870, 19125, 19380, 19635, 19890, 20145, 20400, 20655, 20910, 21165, 21420,
+	21675, 21930, 22185, 22440, 22695, 22950, 23205, 23460, 23715, 23970, 24225, 24480, 24735, 24990, 25245, 25500,
+};
+
 static int pwm_backlight_update_status(struct backlight_device *bl)
 {
 	struct pwm_bl_data *pb = dev_get_drvdata(&bl->dev);
 	int brightness = bl->props.brightness;
 	int max = bl->props.max_brightness;
 
-	if (bl->props.power != FB_BLANK_UNBLANK)
+	if (bl->props.power != FB_BLANK_UNBLANK) {
+		printk("Can't update brightness 'cause of \"bl->props.power != FB_BLANK_UNBLANK\"\n");
 		brightness = 0;
-
-	if (bl->props.fb_blank != FB_BLANK_UNBLANK)
+	}
+	if (bl->props.fb_blank != FB_BLANK_UNBLANK) {
+		printk("Can't update brightness 'cause of \"bl->props.fb_blank != FB_BLANK_UNBLANK\"\n");
 		brightness = 0;
-
-	if (pb->notify)
-		brightness = pb->notify(pb->dev, brightness);
+	}
 
 	if (brightness == 0) {
+		if (pb->notify) {
+			/* ventana_backlight_notify(); */
+			brightness = pb->notify(pb->dev, brightness);
+		}
+
+		/* HSD: TP7= 0 ms~ */
+		msleep(5);
+
+		printk("Disp: brightness= 0\n");
 		pwm_config(pb->pwm, 0, pb->period);
 		pwm_disable(pb->pwm);
 	} else {
-		brightness = pb->lth_brightness +
-			(brightness * (pb->period - pb->lth_brightness) / max);
-		pwm_config(pb->pwm, brightness, pb->period);
-		pwm_enable(pb->pwm);
+		if(b_dc0_enabled) {
+			/* period: pwm period in nsec; max: the max brightness, 255. */
+			printk("Disp: brightness= %d(--> %d); PWM freq= %d Hz\n", brightness, asus_remapped_brightness[brightness], 1000000000/pb->period);
+			pwm_config(pb->pwm, asus_remapped_brightness[brightness] * (pb->period / 100) / max, pb->period);
+			pwm_enable(pb->pwm);
+
+			if (gpio_get_value(ventana_bl_enb) == 0) {
+				/* HSD: TP6= 10ms~ */
+				msleep(10);
+			}
+
+			if (pb->notify) {
+				/* ventana_backlight_notify(); */
+				brightness = pb->notify(pb->dev, brightness);
+			}
+		}
 	}
 	return 0;
 }

@@ -3,6 +3,8 @@
  *
  * Copyright 2005 Phil Blundell
  *
+ * Copyright 2010-2011 NVIDIA Corporation
+ *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
@@ -25,7 +27,31 @@
 #include <linux/gpio_keys.h>
 #include <linux/workqueue.h>
 #include <linux/gpio.h>
+#include <asm/io.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/fcntl.h>
+#include <asm/uaccess.h>
+#include <../arch/arm/mach-tegra/gpio-names.h>
+#include <mach/board-ventana-misc.h>
+#include <linux/rtc.h>
 
+/*
+ * compiler option
+ */
+#define GPIOKEYS_DEBUG			0
+/*
+ * Debug Utility
+ */
+#if GPIOKEYS_DEBUG
+#define GPIOKEYS_INFO(format, arg...)	\
+	printk(KERN_INFO "gpio-keys: [%s] " format , __FUNCTION__ , ## arg)
+#else
+#define GPIOKEYS_INFO(format, arg...)
+#endif
+
+#define GPIOKEYS_ERR(format, arg...)	\
+	printk(KERN_ERR "gpio-keys: [%s] " format , __FUNCTION__ , ## arg)
 struct gpio_button_data {
 	struct gpio_keys_button *button;
 	struct input_dev *input;
@@ -34,7 +60,7 @@ struct gpio_button_data {
 	int timer_debounce;	/* in msecs */
 	bool disabled;
 };
-
+struct workqueue_struct *gpiokey_workqueue=NULL;
 struct gpio_keys_drvdata {
 	struct input_dev *input;
 	struct mutex disable_lock;
@@ -43,6 +69,9 @@ struct gpio_keys_drvdata {
 	void (*disable)(struct device *dev);
 	struct gpio_button_data data[0];
 };
+extern int asusec_open_keyboard(void);
+extern int asusec_close_keyboard(void);
+extern int asusec_dock_resume(void);
 
 /*
  * SYSFS interface for enabling/disabling keys and switches:
@@ -324,8 +353,21 @@ static void gpio_keys_report_event(struct gpio_button_data *bdata)
 	unsigned int type = button->type ?: EV_KEY;
 	int state = (gpio_get_value_cansleep(button->gpio) ? 1 : 0) ^ button->active_low;
 
+	GPIOKEYS_INFO("type = %d, code = %d, state = %d\n", type, button->code, state);
 	input_event(input, type, button->code, !!state);
 	input_sync(input);
+	if ((type == EV_SW) && (ASUSGetProjectID() == 102)){
+		if (state == 0)
+			asusec_close_keyboard();
+		else
+			asusec_open_keyboard();
+	}
+	else if ((type == EV_SW) && (ASUSGetProjectID() == 101)){
+		if (state == 1){
+			GPIOKEYS_INFO("call asusec_dock_resume\n");
+				asusec_dock_resume();
+		}
+	}
 }
 
 static void gpio_keys_work_func(struct work_struct *work)
@@ -340,7 +382,8 @@ static void gpio_keys_timer(unsigned long _data)
 {
 	struct gpio_button_data *data = (struct gpio_button_data *)_data;
 
-	schedule_work(&data->work);
+	/*schedule_work(&data->work);*/
+	queue_work(gpiokey_workqueue,&data->work);
 }
 
 static irqreturn_t gpio_keys_isr(int irq, void *dev_id)
@@ -350,11 +393,27 @@ static irqreturn_t gpio_keys_isr(int irq, void *dev_id)
 
 	BUG_ON(irq != gpio_to_irq(button->gpio));
 
-	if (bdata->timer_debounce)
+	if( button->code == KEY_POWER ){
+		struct input_dev *input = bdata->input;
+		unsigned int type = button->type;
+		int state = (gpio_get_value(button->gpio) ? 1 : 0) ^ button->active_low;
+		static int old_state = 0;
+
+		if(!old_state && (old_state==state)){
+			printk("  gpio_keys_isr send state 1 \n" );
+			input_event(input, type, button->code, 1);
+			input_sync(input);
+		}
+		old_state=!!state;
+		printk(" type = %d, code = %d state =%x\n", button->type, button->code,state  );
+		input_event(input, type, button->code, !!state);
+		input_sync(input);
+	}
+	else if (bdata->timer_debounce)
 		mod_timer(&bdata->timer,
 			jiffies + msecs_to_jiffies(bdata->timer_debounce));
 	else
-		schedule_work(&bdata->work);
+	       queue_work(gpiokey_workqueue,&bdata->work);/*schedule_work(&bdata->work);*/
 
 	return IRQ_HANDLED;
 }
@@ -375,7 +434,7 @@ static int __devinit gpio_keys_setup_key(struct platform_device *pdev,
 	if (error < 0) {
 		dev_err(dev, "failed to request GPIO %d, error %d\n",
 			button->gpio, error);
-		goto fail2;
+		//goto fail2;
 	}
 
 	error = gpio_direction_input(button->gpio);
@@ -449,6 +508,11 @@ static int __devinit gpio_keys_probe(struct platform_device *pdev)
 	int i, error;
 	int wakeup = 0;
 
+	gpiokey_workqueue = create_singlethread_workqueue("GpioKey_workqueue");
+	if ( !gpiokey_workqueue ){
+		dev_err(dev, "failed to allocate GpioKey_workqueue\n");
+		return -ENOMEM;
+	}
 	ddata = kzalloc(sizeof(struct gpio_keys_drvdata) +
 			pdata->nbuttons * sizeof(struct gpio_button_data),
 			GFP_KERNEL);
@@ -565,6 +629,8 @@ static int __devexit gpio_keys_remove(struct platform_device *pdev)
 
 	input_unregister_device(input);
 
+       if (gpiokey_workqueue)
+	   destroy_workqueue(gpiokey_workqueue);
 	return 0;
 }
 
@@ -576,6 +642,7 @@ static int gpio_keys_suspend(struct device *dev)
 	struct gpio_keys_platform_data *pdata = pdev->dev.platform_data;
 	int i;
 
+	printk("gpio_keys_suspend+\n");
 	if (device_may_wakeup(&pdev->dev)) {
 		for (i = 0; i < pdata->nbuttons; i++) {
 			struct gpio_keys_button *button = &pdata->buttons[i];
@@ -585,7 +652,8 @@ static int gpio_keys_suspend(struct device *dev)
 			}
 		}
 	}
-
+	flush_workqueue(gpiokey_workqueue);
+	printk("gpio_keys_suspend-\n");
 	return 0;
 }
 
@@ -594,7 +662,12 @@ static int gpio_keys_resume(struct device *dev)
 	struct platform_device *pdev = to_platform_device(dev);
 	struct gpio_keys_drvdata *ddata = platform_get_drvdata(pdev);
 	struct gpio_keys_platform_data *pdata = pdev->dev.platform_data;
+	int wakeup_key = KEY_RESERVED;
 	int i;
+
+	printk("gpio_keys_resume+\n");
+	if (pdata->wakeup_key)
+		wakeup_key = pdata->wakeup_key();
 
 	for (i = 0; i < pdata->nbuttons; i++) {
 
@@ -602,11 +675,22 @@ static int gpio_keys_resume(struct device *dev)
 		if (button->wakeup && device_may_wakeup(&pdev->dev)) {
 			int irq = gpio_to_irq(button->gpio);
 			disable_irq_wake(irq);
+
+			#if 0
+			if ((wakeup_key == button->code) && (wakeup_key == KEY_POWER)) {
+				unsigned int type = button->type;
+
+				input_event(ddata->input, type, button->code, 1);
+				input_event(ddata->input, type, button->code, 0);
+				input_sync(ddata->input);
+			}
+			#endif
 		}
 
 		gpio_keys_report_event(&ddata->data[i]);
 	}
 	input_sync(ddata->input);
+	printk("gpio_keys_resume-\n");
 
 	return 0;
 }

@@ -36,7 +36,10 @@ void unregister_syscore_ops(struct syscore_ops *ops)
 	mutex_unlock(&syscore_ops_lock);
 }
 EXPORT_SYMBOL_GPL(unregister_syscore_ops);
-
+extern struct timer_list suspend_timer;
+extern void suspend_worker_timeout(unsigned long data);
+extern void watchdog_enable(int sec);
+extern void watchdog_disable(void);
 #ifdef CONFIG_PM_SLEEP
 /**
  * syscore_suspend - Execute all the registered system core suspend callbacks.
@@ -50,6 +53,10 @@ int syscore_suspend(void)
 
 	WARN_ONCE(!irqs_disabled(),
 		"Interrupts enabled before system core suspend.\n");
+
+	watchdog_disable();
+	del_timer_sync(&suspend_timer);
+	destroy_timer_on_stack(&suspend_timer);
 
 	list_for_each_entry_reverse(ops, &syscore_ops_list, node)
 		if (ops->suspend) {
@@ -95,6 +102,12 @@ void syscore_resume(void)
 			WARN_ONCE(!irqs_disabled(),
 				"Interrupts enabled after %pF\n", ops->resume);
 		}
+
+	init_timer_on_stack(&suspend_timer);
+	suspend_timer.expires = jiffies + HZ * 15;
+	suspend_timer.function = suspend_worker_timeout;
+	add_timer(&suspend_timer);
+	watchdog_enable(17);
 }
 EXPORT_SYMBOL_GPL(syscore_resume);
 #endif /* CONFIG_PM_SLEEP */
@@ -110,7 +123,7 @@ void syscore_shutdown(void)
 
 	list_for_each_entry_reverse(ops, &syscore_ops_list, node)
 		if (ops->shutdown) {
-			if (initcall_debug)
+			//if (initcall_debug)
 				pr_info("PM: Calling %pF\n", ops->shutdown);
 			ops->shutdown();
 		}
