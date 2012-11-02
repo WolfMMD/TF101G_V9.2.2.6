@@ -8,7 +8,7 @@
 #include <linux/fs.h>
 #include <linux/interrupt.h>
 #include <mach/board-ventana-misc.h>
-#include <../../arch/arm/mach-tegra/pm-irq.h>
+#include <../arch/arm/mach-tegra/pm-irq.h>
 
 #include "ril.h"
 #include "proximity.h"
