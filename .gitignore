@@ -44,6 +44,8 @@ modules.builtin
 /System.map
 /Module.markers
 /Module.symvers
+/boot.img
+storage0
 
 #
 # git files that we don't want to ignore even it they are dot-files
@@ -57,6 +59,7 @@ modules.builtin
 include/config
 include/linux/version.h
 include/generated
+arch/*/include/generated
 
 # stgit generated dirs
 patches-*
