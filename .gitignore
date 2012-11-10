@@ -32,6 +32,7 @@ modules.builtin
 *.lzo
 *.patch
 *.gcno
+*.LNX
 
 #
 # Top-level generic files
@@ -44,7 +45,7 @@ modules.builtin
 /System.map
 /Module.markers
 /Module.symvers
-/boot.img
+/kern.blob
 storage0
 
 #
