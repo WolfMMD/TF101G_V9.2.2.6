@@ -495,3 +495,11 @@ service dumpstate /system/bin/dumpstate -s
     socket dumpstate stream 0660 shell log
     disabled
     oneshot
+
+# Start kernel configuration
+service yank555-kernel /system/bin/sh /system/etc/init.kernel.sh
+    class main
+    user root
+    group root
+    oneshot
+
